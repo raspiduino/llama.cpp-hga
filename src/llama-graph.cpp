@@ -12,6 +12,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-hga.h"
 
 #include <cassert>
 #include <cmath>
@@ -2668,24 +2669,169 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * cur = nullptr;
+    bool use_hga_attn = false;
+    if (getenv("LLAMA_HGA") && n_tokens >= 1 && !hparams.is_recr(il)) {
+        auto & hga = get_hga_layer(il);
 
-    // store to KV cache
-    {
+        const auto * mctx_cur = inp->mctx;
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
+        // 1. Store to Standard KV Cache (Always do this for Prompt Caching compatibility)
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+        // 2. Store to Quantized CPU History (Respects -ctk)
+        ggml_tensor * k_cur_2d = ggml_reshape_2d(ctx0, k_cur, k_cur->ne[0] * k_cur->ne[1], k_cur->ne[2]);
+        ggml_tensor * v_cur_2d = ggml_reshape_2d(ctx0, v_cur, v_cur->ne[0] * v_cur->ne[1], v_cur->ne[2]);
+        
+        ggml_tensor * hga_idxs = ggml_arange(ctx0, (float)hga.tokens_processed, (float)(hga.tokens_processed + n_tokens), 1.0f);
+        hga_idxs = ggml_cast(ctx0, hga_idxs, GGML_TYPE_I32);
+
+        // ggml_set_rows natively handles the F32 -> Q4_0 quantization and PCIe DMA!
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.cpu_hist_k, k_cur_2d, hga_idxs));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.cpu_hist_v, v_cur_2d, hga_idxs));
+
+        // 3. Cast to BF16 for Summary Math Purity
+        ggml_tensor * k_bf16 = ggml_cast(ctx0, k_cur, GGML_TYPE_BF16);
+
+        // 4. CHUNK BOUNDARY TRIGGER (With Carry Buffer Stitching)
+        int start_pos = hga.tokens_processed;
+        int end_pos = start_pos + n_tokens;
+        int chunk_size = g_hga_config.chunk_size;
+        int first_closed = start_pos / chunk_size;
+        int last_closed = end_pos / chunk_size;         
+
+        int64_t head_dim = hparams.n_embd_head_k(il);
+        int64_t n_head_kv = hparams.n_head_kv(il);
+
+        for (int c = first_closed; c < last_closed; ++c) {
+            int chunk_start = c * chunk_size;
+            
+            // How many tokens do we need from the carry buffer?
+            int carry_needed = start_pos - chunk_start;
+            if (carry_needed < 0) carry_needed = 0;
+            int new_needed = chunk_size - carry_needed;
+            
+            ggml_tensor * summary_input = nullptr;
+            
+            if (carry_needed > 0 && new_needed > 0) {  
+                // 1. Stitch Carry Buffer + New Tokens  
+                ggml_tensor * carry_slice = ggml_view_3d(ctx0, hga.gpu_carry_k, head_dim, n_head_kv, carry_needed,  
+                                                         hga.gpu_carry_k->nb[1], hga.gpu_carry_k->nb[2], 0);  
+                  
+                // Cast carry_slice to match k_bf16's type for ggml_concat
+                ggml_tensor * carry_slice_cast = carry_slice;
+                if (carry_slice->type != k_bf16->type) {
+                    carry_slice_cast = ggml_cast(ctx0, carry_slice, k_bf16->type);
+                }
+
+                // CRITICAL FIX: When a chunk crosses the boundary, the new tokens 
+                // ALWAYS start at the very beginning of the current ubatch (index 0).
+                ggml_tensor * new_slice = ggml_view_3d(ctx0, k_bf16, head_dim, n_head_kv, new_needed,  
+                                                       k_bf16->nb[1], k_bf16->nb[2], 0); // <-- OFFSET IS 0
+                                                         
+                summary_input = ggml_concat(ctx0, carry_slice_cast, new_slice, 2);  
+
+            } else if (carry_needed > 0) {
+                // 2. Edge Case: The entire chunk comes from the carry buffer
+                ggml_tensor * carry_slice = ggml_view_3d(ctx0, hga.gpu_carry_k, head_dim, n_head_kv, carry_needed,  
+                                                         hga.gpu_carry_k->nb[1], hga.gpu_carry_k->nb[2], 0);
+                summary_input = carry_slice;
+                
+                if (summary_input->type != k_bf16->type) {
+                    summary_input = ggml_cast(ctx0, summary_input, k_bf16->type);
+                }
+
+            } else if (new_needed > 0) {
+                // 3. Edge Case: The entire chunk is in the current ubatch (no carry needed)
+                int k_offset = chunk_start - start_pos; // Guaranteed >= 0 here
+                summary_input = ggml_view_3d(ctx0, k_bf16, head_dim, n_head_kv, new_needed,  
+                                             k_bf16->nb[1], k_bf16->nb[2], k_offset * k_bf16->nb[2]);
+            }
+            
+            ggml_tensor * summary_slot = ggml_view_2d(ctx0, hga.gpu_summaries, head_dim * n_head_kv, 1, 
+                                                      hga.gpu_summaries->nb[2], c * hga.gpu_summaries->nb[2]);
+            summary_slot = ggml_reshape_3d(ctx0, summary_slot, head_dim, n_head_kv, 1);
+            
+            float theta_base = hparams.rope_freq_base_train;
+            ggml_tensor * summary_out = ggml_hga_summary(ctx0, summary_input, c * chunk_size, theta_base, summary_slot);
+            ggml_build_forward_expand(gf, summary_out);
+            
+            hga.n_chunks_closed++;
+        }
+        
+                // 5. Update Carry Buffer for the next ubatch (Robust State-Machine Approach)
+        int prev_carry_count = start_pos % chunk_size;
+        int total_tokens = prev_carry_count + n_tokens;
+        int chunks_closed = total_tokens / chunk_size;
+        int new_carry_count = total_tokens % chunk_size;
+
+        if (new_carry_count > 0) {
+            int64_t embd_k = head_dim * n_head_kv;
+            
+            // Reshape the persistent carry buffer to 2D 
+            ggml_tensor * carry_k_2d = ggml_reshape_2d(ctx0, hga.gpu_carry_k, embd_k, chunk_size);
+
+            ggml_tensor * src_slice = nullptr;
+            ggml_tensor * dst_indices = nullptr;
+
+            if (chunks_closed == 0) {
+                // Case 1: No chunk closed. Append all of k_bf16 to the carry buffer.
+                src_slice = ggml_reshape_2d(ctx0, k_bf16, embd_k, n_tokens);
+                dst_indices = ggml_arange(ctx0, (float)prev_carry_count, (float)(prev_carry_count + n_tokens), 1.0f);
+            } else {
+                // Case 2: Chunk(s) closed. The new carry is the tail of k_bf16.
+                int carry_offset = n_tokens - new_carry_count;
+                ggml_tensor * tail_slice = ggml_view_3d(ctx0, k_bf16, head_dim, n_head_kv, new_carry_count,
+                                                        k_bf16->nb[1], k_bf16->nb[2], carry_offset * k_bf16->nb[2]);
+                src_slice = ggml_reshape_2d(ctx0, tail_slice, embd_k, new_carry_count);
+                dst_indices = ggml_arange(ctx0, 0.0f, (float)new_carry_count, 1.0f);
+            }
+
+            // Cast source to F16 for ggml_set_rows
+            ggml_tensor * src_slice_f16 = src_slice;
+            if (src_slice->type != GGML_TYPE_F16) {
+                src_slice_f16 = ggml_cast(ctx0, src_slice, GGML_TYPE_F16);
+            }
+
+            dst_indices = ggml_cast(ctx0, dst_indices, GGML_TYPE_I32);
+
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, carry_k_2d, src_slice_f16, dst_indices));
+        }
+        
+        hga.carry_count = new_carry_count;
+        hga.tokens_processed = end_pos;
+
+        if (hga.n_chunks_closed >= g_hga_config.num_routed_chunks) {
+            use_hga_attn = true;
+        }
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    // 4. ATTENTION EXECUTION
+    if (use_hga_attn) {
+        cur = llm_build_hga_attn(*this, inp, q_cur, k_cur, v_cur, kq_b, sinks, kq_scale, il);
+    } else {
+        // Standard Dense Path (Prefill bootstrap or Recurrent layers)
+        const auto * mctx_cur = inp->mctx;
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+        // FIX: Only store to standard KV cache if HGA didn't already do it above!
+        if (!getenv("LLAMA_HGA") || hparams.is_recr(il)) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+        ggml_tensor * kq_mask = inp->get_kq_mask();
+        ggml_tensor * q = q_cur;
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
+
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

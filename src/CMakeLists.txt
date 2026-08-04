@@ -41,6 +41,7 @@ add_library(llama
             unicode.cpp
             unicode.h
             ${LLAMA_MODELS_SOURCES}
+            llama-hga.cpp
             )
 
 set_target_properties(llama PROPERTIES

@@ -2076,6 +2076,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_HGA_SUMMARY:
+            {
+                // nop
+            } break;
+        case GGML_OP_HGA_ROUTE:
+            {
+                // nop
+            } break;
+        case GGML_OP_HGA_STITCH:
+            {
+                // nop
+            } break;
+        case GGML_OP_HGA_MASK:
+            {
+                // nop
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);

@@ -574,6 +574,10 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HGA_SUMMARY,
+        GGML_OP_HGA_ROUTE,
+        GGML_OP_HGA_STITCH,
+        GGML_OP_HGA_MASK,
 
         GGML_OP_UNARY,
 

@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-hga.h"
 
 #include <algorithm>
 #include <cassert>
@@ -160,6 +161,11 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    bool hga_enabled = getenv("LLAMA_HGA") != nullptr;
+    if (hga_enabled) {
+        hga_init_layers(hparams.n_layer());
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -233,6 +239,53 @@ llama_kv_cache::llama_kv_cache(
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
+
+        if (hga_enabled && !hparams.is_recr(il)) {
+            const uint32_t chunk_size = g_hga_config.chunk_size;
+            const uint32_t max_hist_tokens = kv_size; 
+            const uint32_t max_chunks = (max_hist_tokens + chunk_size - 1) / chunk_size;
+            const uint32_t working_chunks = g_hga_config.get_working_chunks();
+            
+            // DEDICATED CONTEXTS (Bypasses llama.cpp's deferred allocation pruning)
+            // mem_size is in BYTES. 1MB is plenty for tensor metadata.
+            // no_alloc MUST be true so ggml_new_tensor doesn't try to allocate the 
+            // massive data buffers inside the context's metadata arena.
+            ggml_init_params params_cpu = { 1024 * 1024, NULL, true }; 
+            ggml_context * ctx_hga_cpu = ggml_init(params_cpu);
+            
+            ggml_init_params params_gpu = { 1024 * 1024, NULL, true }; 
+            ggml_context * ctx_hga_gpu = ggml_init(params_gpu);
+            
+            ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(model.dev_layer(il));
+            
+            llama_hga_layer hga;
+            hga.ctx_cpu = ctx_hga_cpu;
+            hga.ctx_gpu = ctx_hga_gpu;
+            
+            // 1. Create Tensors (Metadata only, data pointers remain NULL)
+            // CPU RAM: Full 64K Quantized History
+            hga.cpu_hist_k = ggml_new_tensor_2d(ctx_hga_cpu, type_k, n_embd_k_gqa, max_hist_tokens);
+            hga.cpu_hist_v = ggml_new_tensor_2d(ctx_hga_cpu, type_v, n_embd_v_gqa, max_hist_tokens);
+            
+            // GPU VRAM: Small working sets, summaries, and carry buffers
+            hga.gpu_scratch_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, working_chunks * chunk_size);
+            hga.gpu_scratch_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, working_chunks * chunk_size);
+            hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);
+            hga.gpu_carry_k   = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), chunk_size);
+            
+            // 2. EXPLICIT ALLOCATION (Assigns physical RAM/VRAM RIGHT NOW)
+            hga.buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hga_cpu, ggml_backend_cpu_buffer_type());
+            hga.buf_gpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hga_gpu, buft_gpu);
+            
+            if (!hga.buf_cpu || !hga.buf_gpu) {
+                throw std::runtime_error("HGA: Failed to allocate explicit CPU/GPU buffers");
+            }
+
+            hga.tokens_processed = 0;
+            hga.n_chunks_closed = 0;
+            hga.carry_count = 0;
+            set_hga_layer(il, hga);
+        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -401,6 +454,10 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    if (getenv("LLAMA_HGA")) {
+        hga_truncate_layers(0); // Full wipe
+    }
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -501,6 +558,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    // HGA BRANCHING & TRUNCATION HOOK
+    // If the sequence being cleared is our active sequence (or all sequences),
+    // we logically truncate the HGA history to the branching point (p0).
+    if (getenv("LLAMA_HGA") && (seq_id == 0 || seq_id == -1)) {
+        int32_t keep_tokens = (p0 < 0) ? 0 : p0;
+        hga_truncate_layers(keep_tokens);
+    }
+
     return true;
 }
 
@@ -594,6 +659,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
+
+    if (getenv("LLAMA_HGA") && seq_id_dst == 0) {
+        hga_truncate_layers(0); // PoC limitation: cannot copy HGA state across sequences
+    }
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
@@ -671,6 +740,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
+
+    if (getenv("LLAMA_HGA") && shift != 0 && (seq_id == 0 || seq_id == -1)) {
+        hga_truncate_layers(0); // Context shift invalidates absolute positions
+    }
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {

@@ -59,6 +59,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/hga.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2345,6 +2346,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+            break;
+        case GGML_OP_HGA_SUMMARY:
+            ggml_cuda_op_hga_summary(ctx, dst);
+            break;
+        case GGML_OP_HGA_ROUTE:
+            ggml_cuda_op_hga_route(ctx, dst);
+            break;
+        case GGML_OP_HGA_STITCH:
+            ggml_cuda_op_hga_stitch(ctx, dst);
+            break;
+        case GGML_OP_HGA_MASK:
+            ggml_cuda_op_hga_mask(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
@@ -5138,6 +5151,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
+        case GGML_OP_HGA_SUMMARY:
+        case GGML_OP_HGA_ROUTE:
+        case GGML_OP_HGA_STITCH:
+        case GGML_OP_HGA_MASK:
             return true;
         case GGML_OP_GATED_DELTA_NET:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
