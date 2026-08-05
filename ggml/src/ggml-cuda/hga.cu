@@ -238,3 +238,26 @@ void ggml_cuda_op_hga_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     hga_mask_kernel<<<grid, block, 0, ctx.stream()>>>(
         (half*)dst->data, history_tokens, n_tokens, stride);
 }
+
+// ==============================================================================
+// ZERO-COPY PINNED MEMORY BRIDGE (Exposed to core llama.cpp)
+// ==============================================================================
+extern "C" {
+    // Prototypes to silence -Wmissing-declarations
+    void hga_alloc_pinned_mapped(size_t bytes, void** host_ptr, void** dev_ptr);
+    void hga_free_pinned_mapped(void* host_ptr);
+
+    void hga_alloc_pinned_mapped(size_t bytes, void** host_ptr, void** dev_ptr) {
+        cudaError_t err = cudaHostAlloc(host_ptr, bytes, cudaHostAllocMapped);
+        if (err == cudaSuccess) {
+            cudaHostGetDevicePointer(dev_ptr, *host_ptr, 0);
+        } else {
+            *host_ptr = nullptr;
+            *dev_ptr = nullptr;
+        }
+    }
+    
+    void hga_free_pinned_mapped(void* host_ptr) {
+        if (host_ptr) cudaFreeHost(host_ptr);
+    }
+}

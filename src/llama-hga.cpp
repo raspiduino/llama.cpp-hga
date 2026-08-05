@@ -21,6 +21,21 @@ void hga_truncate_layers(int32_t keep_tokens) {
     }
 }
 
+#ifndef GGML_USE_CUDA
+extern "C" {
+
+void hga_alloc_pinned_mapped(size_t bytes, void** host_ptr, void** dev_ptr) {
+    *host_ptr = malloc(bytes);
+    *dev_ptr = *host_ptr;
+}
+
+void hga_free_pinned_mapped(void* host_ptr) {
+    free(host_ptr);
+}
+
+} // extern "C"
+#endif
+
 ggml_tensor * ggml_hga_summary(ggml_context * ctx, ggml_tensor * k_acc, int32_t start_pos, float theta_base, ggml_tensor * out_slot) {
     ggml_tensor * op = ggml_new_tensor(ctx, out_slot->type, GGML_MAX_DIMS, out_slot->ne);
     op->op = GGML_OP_HGA_SUMMARY; op->src[0] = k_acc;

@@ -242,44 +242,68 @@ llama_kv_cache::llama_kv_cache(
 
         if (hga_enabled && !hparams.is_recr(il)) {
             const uint32_t chunk_size = g_hga_config.chunk_size;
-            const uint32_t max_hist_tokens = kv_size; 
+            const uint32_t max_hist_tokens = kv_size;
             const uint32_t max_chunks = (max_hist_tokens + chunk_size - 1) / chunk_size;
             const uint32_t working_chunks = g_hga_config.get_working_chunks();
-            
-            // DEDICATED CONTEXTS (Bypasses llama.cpp's deferred allocation pruning)
-            // mem_size is in BYTES. 1MB is plenty for tensor metadata.
-            // no_alloc MUST be true so ggml_new_tensor doesn't try to allocate the 
-            // massive data buffers inside the context's metadata arena.
-            ggml_init_params params_cpu = { 1024 * 1024, NULL, true }; 
+              
+            ggml_init_params params_cpu = { 1024 * 1024, NULL, true }; // no_alloc = true
             ggml_context * ctx_hga_cpu = ggml_init(params_cpu);
-            
-            ggml_init_params params_gpu = { 1024 * 1024, NULL, true }; 
+              
+            ggml_init_params params_gpu = { 1024 * 1024, NULL, true };
             ggml_context * ctx_hga_gpu = ggml_init(params_gpu);
-            
+              
             ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(model.dev_layer(il));
-            
+              
             llama_hga_layer hga;
             hga.ctx_cpu = ctx_hga_cpu;
             hga.ctx_gpu = ctx_hga_gpu;
-            
-            // 1. Create Tensors (Metadata only, data pointers remain NULL)
-            // CPU RAM: Full 64K Quantized History
+              
+            // 1. Create Tensors (Metadata only)
             hga.cpu_hist_k = ggml_new_tensor_2d(ctx_hga_cpu, type_k, n_embd_k_gqa, max_hist_tokens);
             hga.cpu_hist_v = ggml_new_tensor_2d(ctx_hga_cpu, type_v, n_embd_v_gqa, max_hist_tokens);
-            
-            // GPU VRAM: Small working sets, summaries, and carry buffers
+              
             hga.gpu_scratch_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, working_chunks * chunk_size);
             hga.gpu_scratch_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, working_chunks * chunk_size);
             hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_BF16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);
             hga.gpu_carry_k   = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), chunk_size);
-            
-            // 2. EXPLICIT ALLOCATION (Assigns physical RAM/VRAM RIGHT NOW)
-            hga.buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hga_cpu, ggml_backend_cpu_buffer_type());
+              
+            // =====================================================================
+            // 2. EXPLICIT ALLOCATION (GPU Standard + CPU Zero-Copy Pinned)
+            // =====================================================================
+            // GPU Allocation
             hga.buf_gpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hga_gpu, buft_gpu);
-            
-            if (!hga.buf_cpu || !hga.buf_gpu) {
-                throw std::runtime_error("HGA: Failed to allocate explicit CPU/GPU buffers");
+            if (!hga.buf_gpu) {
+                throw std::runtime_error("HGA: Failed to allocate GPU buffers");
             }
+
+            // CPU Pinned Allocation (Zero-Copy PCIe via Bridge)
+            size_t hist_k_bytes = ggml_nbytes(hga.cpu_hist_k);
+            size_t hist_v_bytes = ggml_nbytes(hga.cpu_hist_v);
+            
+            void* pinned_k_host = nullptr;
+            void* pinned_v_host = nullptr;
+            void* pinned_k_dev  = nullptr;
+            void* pinned_v_dev  = nullptr;
+
+            // Call the bridge (resolves to CUDA mapped memory or CPU malloc)
+            hga_alloc_pinned_mapped(hist_k_bytes, &pinned_k_host, &pinned_k_dev);
+            hga_alloc_pinned_mapped(hist_v_bytes, &pinned_v_host, &pinned_v_dev);
+
+            if (!pinned_k_host || !pinned_v_host) {
+                throw std::runtime_error("HGA: Failed to allocate pinned CPU memory");
+            }
+
+            // Assign host pointers to ggml tensors (so CPU-side set_rows/cpy works normally)
+            hga.cpu_hist_k->data = pinned_k_host;
+            hga.cpu_hist_v->data = pinned_v_host;
+            
+            // Store in HGA struct for the CUDA kernels to use
+            hga.pinned_k_host = pinned_k_host;
+            hga.pinned_v_host = pinned_v_host;
+            hga.cpu_hist_k_dev = pinned_k_dev;
+            hga.cpu_hist_v_dev = pinned_v_dev;
+            
+            hga.buf_cpu = nullptr; 
 
             hga.tokens_processed = 0;
             hga.n_chunks_closed = 0;

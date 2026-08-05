@@ -26,6 +26,11 @@ struct llama_hga_layer {
     ggml_backend_buffer_t buf_cpu;
     ggml_backend_buffer_t buf_gpu;
 
+    void * pinned_k_host;
+    void * pinned_v_host;
+    void * cpu_hist_k_dev;
+    void * cpu_hist_v_dev;
+
     uint32_t tokens_processed = 0, n_chunks_closed = 0, carry_count = 0; 
 };
 
@@ -33,6 +38,18 @@ void hga_init_layers(int n_layers);
 void set_hga_layer(int32_t il, const llama_hga_layer & hga);
 llama_hga_layer & get_hga_layer(int32_t il);
 void hga_truncate_layers(int32_t keep_tokens);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Bridge functions for backend-specific memory allocation
+void hga_alloc_pinned_mapped(size_t bytes, void** host_ptr, void** dev_ptr);
+void hga_free_pinned_mapped(void* host_ptr);
+
+#ifdef __cplusplus
+}
+#endif
 
 ggml_tensor * ggml_hga_summary(ggml_context * ctx, ggml_tensor * k_acc, int32_t start_pos, float theta_base, ggml_tensor * out_slot);
 ggml_tensor * ggml_hga_route(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * summaries, int32_t valid_chunks);
