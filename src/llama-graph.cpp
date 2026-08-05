@@ -2762,7 +2762,7 @@ ggml_tensor * llm_graph_context::build_attn(
             hga.n_chunks_closed++;
         }
         
-                // 5. Update Carry Buffer for the next ubatch (Robust State-Machine Approach)
+        // 5. Update Carry Buffer for the next ubatch (Robust State-Machine Approach)
         int prev_carry_count = start_pos % chunk_size;
         int total_tokens = prev_carry_count + n_tokens;
         int chunks_closed = total_tokens / chunk_size;

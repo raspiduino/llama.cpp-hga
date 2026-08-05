@@ -270,7 +270,7 @@ llama_kv_cache::llama_kv_cache(
             // GPU VRAM: Small working sets, summaries, and carry buffers
             hga.gpu_scratch_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, working_chunks * chunk_size);
             hga.gpu_scratch_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, working_chunks * chunk_size);
-            hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);
+            hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_BF16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);
             hga.gpu_carry_k   = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), chunk_size);
             
             // 2. EXPLICIT ALLOCATION (Assigns physical RAM/VRAM RIGHT NOW)

@@ -59,13 +59,11 @@ ggml_tensor * llm_build_hga_attn(
     ggml_context * ctx0 = llm.ctx0;
     ggml_cgraph * gf = llm.gf;
     
-    int valid_chunks = hga.n_chunks_closed;
-    
+    uint32_t valid_chunks = hga.n_chunks_closed;
+
     // 1. Mathematically Pure Routing (Runs on GPU)
     ggml_tensor * scores = ggml_hga_route(ctx0, q_cur, hga.gpu_summaries, valid_chunks);
-    ggml_tensor * topk_idx = ggml_top_k(ctx0, scores, g_hga_config.num_routed_chunks);
-    
-    // 2. THE NATIVE CPU GATHER (Zero-Cost Reshape + ggml_get_rows)
+
     int64_t chunk_size = g_hga_config.chunk_size;
     int64_t embd_k = k_cur->ne[0] * k_cur->ne[1];
     int64_t embd_v = v_cur->ne[0] * v_cur->ne[1];
@@ -74,64 +72,96 @@ ggml_tensor * llm_build_hga_attn(
     // Because chunks are contiguous in memory, this is a perfectly valid zero-cost view.
     ggml_tensor * hist_k_chunked = ggml_reshape_2d(ctx0, hga.cpu_hist_k, embd_k * chunk_size, hga.cpu_hist_k->ne[1] / chunk_size);
     ggml_tensor * hist_v_chunked = ggml_reshape_2d(ctx0, hga.cpu_hist_v, embd_v * chunk_size, hga.cpu_hist_v->ne[1] / chunk_size);
-    
-    // ggml_get_rows runs natively on the CPU backend. 
-    // The scheduler will automatically:
-    // 1. Copy topk_idx (64 bytes) from GPU to CPU.
-    // 2. Gather ONLY the routed chunks (~2MB) on the CPU.
-    // 3. Copy the gathered F32 result to GPU for FlashAttention.
-    ggml_tensor * k_gathered_chunked = ggml_get_rows(ctx0, hist_k_chunked, topk_idx);
-    ggml_tensor * v_gathered_chunked = ggml_get_rows(ctx0, hist_v_chunked, topk_idx);
-    
-    // Reshape back to standard token layout [embd, gathered_tokens]
-    int64_t gathered_tokens = g_hga_config.num_routed_chunks * chunk_size;
-    ggml_tensor * k_gathered = ggml_reshape_2d(ctx0, k_gathered_chunked, embd_k, gathered_tokens);
-    ggml_tensor * v_gathered = ggml_reshape_2d(ctx0, v_gathered_chunked, embd_v, gathered_tokens);
-    
-    ggml_build_forward_expand(gf, k_gathered);
-    ggml_build_forward_expand(gf, v_gathered);
-    
-    // 4. Fused Stitch (Quantization-aware VRAM Concatenation)
-    int history_tokens = g_hga_config.get_working_chunks() * g_hga_config.chunk_size;
-    ggml_tensor * dummy = ggml_new_tensor_3d(ctx0, k_cur->type, k_cur->ne[0], k_cur->ne[1], 1);
-    
-    ggml_tensor * k_full = ggml_hga_stitch(ctx0, dummy, k_gathered, dummy, k_cur, 0, history_tokens, 0);
-    ggml_tensor * v_full = ggml_hga_stitch(ctx0, dummy, v_gathered, dummy, v_cur, 0, history_tokens, 0);
-    ggml_build_forward_expand(gf, k_full);
-    ggml_build_forward_expand(gf, v_full);
-    
+
+    // =====================================================================
+    // THE TIERED GATHER: Sinks + Routed + Local (Mirroring vLLM)
+    // =====================================================================
+    uint32_t sink_end = std::min(g_hga_config.num_sink_chunks, valid_chunks);
+    uint32_t local_start = std::max(sink_end, valid_chunks - g_hga_config.num_local_chunks);
+    uint32_t mid_chunks = local_start - sink_end;
+    uint32_t k_to_route = std::min(g_hga_config.num_routed_chunks, mid_chunks);
+
+    ggml_tensor * final_idxs = nullptr;
+
+    // A. Sinks (Always attend to the beginning of the prompt)
+    if (sink_end > 0) {
+        final_idxs = ggml_arange(ctx0, 0.0f, (float)sink_end, 1.0f);
+        final_idxs = ggml_cast(ctx0, final_idxs, GGML_TYPE_I32);
+    }
+
+    // B. Routed (The sparse middle history)
+    if (k_to_route > 0) {
+        // Note: top_k might pick a sink/local index. FlashAttn handles duplicate keys gracefully.
+        ggml_tensor * routed_idxs = ggml_top_k(ctx0, scores, k_to_route);
+        if (final_idxs) {
+            final_idxs = ggml_concat(ctx0, final_idxs, routed_idxs, 0);
+        } else {
+            final_idxs = routed_idxs;
+        }
+    }
+
+    // C. Local (The sliding window immediately before the current ubatch)
+    if (local_start < valid_chunks) {
+        ggml_tensor * local_idxs = ggml_arange(ctx0, (float)local_start, (float)valid_chunks, 1.0f);
+        local_idxs = ggml_cast(ctx0, local_idxs, GGML_TYPE_I32);
+        if (final_idxs) {
+            final_idxs = ggml_concat(ctx0, final_idxs, local_idxs, 0);
+        } else {
+            final_idxs = local_idxs;
+        }
+    }
+
+    // =====================================================================
+    // GATHER & STITCH
+    // =====================================================================
+    ggml_tensor * k_full = nullptr;
+    ggml_tensor * v_full = nullptr;
+    int history_tokens = 0;
+
+    if (final_idxs) {
+        ggml_tensor * k_gathered_chunked = ggml_get_rows(ctx0, hist_k_chunked, final_idxs);
+        ggml_tensor * v_gathered_chunked = ggml_get_rows(ctx0, hist_v_chunked, final_idxs);
+
+        int64_t gathered_chunks = final_idxs->ne[0];
+        history_tokens = gathered_chunks * chunk_size;
+
+        ggml_tensor * k_gathered = ggml_reshape_2d(ctx0, k_gathered_chunked, embd_k, history_tokens);
+        ggml_tensor * v_gathered = ggml_reshape_2d(ctx0, v_gathered_chunked, embd_v, history_tokens);
+
+        ggml_build_forward_expand(gf, k_gathered);
+        ggml_build_forward_expand(gf, v_gathered);
+
+        ggml_tensor * dummy = ggml_new_tensor_3d(ctx0, k_cur->type, k_cur->ne[0], k_cur->ne[1], 1);
+        k_full = ggml_hga_stitch(ctx0, dummy, k_gathered, dummy, k_cur, 0, history_tokens, 0);
+        v_full = ggml_hga_stitch(ctx0, dummy, v_gathered, dummy, v_cur, 0, history_tokens, 0);
+        
+        ggml_build_forward_expand(gf, k_full);
+        ggml_build_forward_expand(gf, v_full);
+    } else {
+        // Edge case: No history yet (first ubatch)
+        k_full = k_cur;
+        v_full = v_cur;
+    }
+
     // 5. THE PERMUTE TRICK: [D, H, N, B] -> [D, N, H, B]
-    // FlashAttention strictly requires ne[2] to be the Head dimension for GQA validation.
     ggml_tensor * q_perm = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
     ggml_tensor * k_perm = ggml_permute(ctx0, k_full, 0, 2, 1, 3);
     ggml_tensor * v_perm = ggml_permute(ctx0, v_full, 0, 2, 1, 3);
-    
+
     // 6. Build the HGA Causal Mask
-    int n_tokens = k_cur->ne[2]; 
-    
-    // Fetch the native mask. We don't use its data, but we MUST link it to the graph.
-    ggml_tensor * kq_mask = inp->get_kq_mask(); 
+    int n_tokens = k_cur->ne[2];
+    ggml_tensor * kq_mask = inp->get_kq_mask();
     
     ggml_tensor * hga_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, history_tokens + n_tokens, n_tokens, 1, 1);
     hga_mask->op = GGML_OP_HGA_MASK;
-    
-    // =====================================================================
-    // THE "KEEP-ALIVE" ANCHOR
-    // =====================================================================
-    // Because HGA bypasses the standard attention path, kq_mask is never used 
-    // as a source for any compute node. The ggml backend scheduler prunes 
-    // unused leaf nodes and DOES NOT allocate a buffer for them.
-    // When llama.cpp later calls set_input_kq_mask, it crashes on a nullptr buffer.
-    // By attaching kq_mask as src[0], we force the scheduler to allocate its buffer.
-    hga_mask->src[0] = kq_mask; 
+    hga_mask->src[0] = kq_mask; // Keep-alive anchor
     
     int32_t mask_params[2] = {history_tokens, n_tokens};
     memcpy(hga_mask->op_params, mask_params, sizeof(mask_params));
-    
     ggml_build_forward_expand(gf, hga_mask);
-    
+
     // 7. Execute Flash Attention
-    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q_perm, k_perm, v_perm, hga_mask, kq_scale, 
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q_perm, k_perm, v_perm, hga_mask, kq_scale,
                                   llm.hparams.f_max_alibi_bias,
                                   llm.hparams.attn_soft_cap ? llm.hparams.f_attn_logit_softcapping : 0.0f);
     
