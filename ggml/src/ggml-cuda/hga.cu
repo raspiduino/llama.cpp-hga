@@ -164,36 +164,46 @@ void ggml_cuda_op_hga_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 }
 
 // ==============================================================================
-// 3. HGA STITCH: Quantization-aware VRAM Concatenation
+// 3. HGA STITCH: Quantization-aware VRAM Concatenation (Fused 3-Way)
 // ==============================================================================
 __global__ void hga_stitch_kernel(
-    const char* __restrict__ sink, const char* __restrict__ rout, 
-    const char* __restrict__ local, const char* __restrict__ cur, char* __restrict__ out,
-    int sink_tokens, int rout_tokens, int local_tokens, int cur_tokens, size_t token_bytes) {
-    
+    const char* __restrict__ hist, const char* __restrict__ unclosed, const char* __restrict__ cur, 
+    char* __restrict__ out,
+    int hist_tokens, int unclosed_tokens, int cur_tokens, size_t token_bytes) {
+      
     int tok_idx = blockIdx.x;
-    int total_hist = sink_tokens + rout_tokens + local_tokens;
-    const char* src_ptr = nullptr; int src_tok_idx = 0;
-    
-    if (tok_idx < sink_tokens) { src_ptr = sink; src_tok_idx = tok_idx; } 
-    else if (tok_idx < sink_tokens + rout_tokens) { src_ptr = rout; src_tok_idx = tok_idx - sink_tokens; } 
-    else if (tok_idx < total_hist) { src_ptr = local; src_tok_idx = tok_idx - sink_tokens - rout_tokens; } 
-    else { src_ptr = cur; src_tok_idx = tok_idx - total_hist; }
-    
+    const char* src_ptr = nullptr; 
+    int src_tok_idx = 0;
+      
+    if (tok_idx < hist_tokens) { 
+        src_ptr = hist; 
+        src_tok_idx = tok_idx; 
+    } else if (tok_idx < hist_tokens + unclosed_tokens) { 
+        src_ptr = unclosed; 
+        src_tok_idx = tok_idx - hist_tokens; 
+    } else { 
+        src_ptr = cur; 
+        src_tok_idx = tok_idx - hist_tokens - unclosed_tokens; 
+    }
+      
     for (size_t i = threadIdx.x; i < token_bytes; i += blockDim.x) {
         out[tok_idx * token_bytes + i] = src_ptr[src_tok_idx * token_bytes + i];
     }
 }
 
 void ggml_cuda_op_hga_stitch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    int32_t params[5]; memcpy(params, dst->op_params, sizeof(params));
-    int sink_tokens = params[0], rout_tokens = params[1], local_tokens = params[2], cur_tokens = params[3];
-    size_t token_bytes = (size_t)params[4];
-    int total_tokens = sink_tokens + rout_tokens + local_tokens + cur_tokens;
+    int32_t params[4]; memcpy(params, dst->op_params, sizeof(params));
+    int hist_tokens = params[0], unclosed_tokens = params[1], cur_tokens = params[2];
+    size_t token_bytes = (size_t)params[3];
+    int total_tokens = hist_tokens + unclosed_tokens + cur_tokens;
+    
+    const char* hist_ptr = (const char*)dst->src[0]->data;
+    const char* unclosed_ptr = (const char*)dst->src[1]->data;
+    const char* cur_ptr = (const char*)dst->src[2]->data;
+    
     hga_stitch_kernel<<<total_tokens, 256, 0, ctx.stream()>>>(
-        (const char*)dst->src[0]->data, (const char*)dst->src[1]->data,
-        (const char*)dst->src[2]->data, (const char*)dst->src[3]->data, (char*)dst->data,
-        sink_tokens, rout_tokens, local_tokens, cur_tokens, token_bytes);
+        hist_ptr, unclosed_ptr, cur_ptr, (char*)dst->data,
+        hist_tokens, unclosed_tokens, cur_tokens, token_bytes);
 }
 
 // ==============================================================================
