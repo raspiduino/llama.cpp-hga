@@ -54,5 +54,5 @@ void hga_free_pinned_mapped(void* host_ptr);
 ggml_tensor * ggml_hga_summary(ggml_context * ctx, ggml_tensor * k_acc, int32_t start_pos, float theta_base, ggml_tensor * out_slot);
 ggml_tensor * ggml_hga_route(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * summaries, int32_t valid_chunks);
 ggml_tensor * ggml_hga_stitch(ggml_context * ctx, ggml_tensor * hist, ggml_tensor * unclosed, ggml_tensor * cur, int32_t hist_tokens, int32_t unclosed_tokens);
-
+ggml_tensor * ggml_hga_gather(ggml_context * ctx, ggml_tensor * routed_idxs, ggml_tensor * src, int32_t sink_end, int32_t k_to_route, int32_t local_start, int32_t valid_chunks, int32_t chunk_size);
 ggml_tensor * llm_build_hga_attn(const llm_graph_context & llm, llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur, ggml_tensor * kq_b, ggml_tensor * sinks, float kq_scale, int il);

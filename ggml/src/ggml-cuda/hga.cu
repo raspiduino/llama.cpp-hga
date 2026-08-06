@@ -240,6 +240,75 @@ void ggml_cuda_op_hga_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // ==============================================================================
+// 5. HGA GATHER: Token-Level Tiered Byte-Copy (Maximizes PCIe Concurrency)
+// ==============================================================================
+__global__ void hga_gather_tokens_kernel(
+    const int32_t* __restrict__ routed_idxs,
+    const char* __restrict__ src, 
+    char* __restrict__ dst,       
+    int sink_end, int k_to_route, int local_start, int valid_chunks,
+    int chunk_size, size_t token_bytes) 
+{
+    int out_tok = blockIdx.x;
+    int total_out_chunks = sink_end + k_to_route + (valid_chunks - local_start);
+    int total_out_tokens = total_out_chunks * chunk_size;
+    if (out_tok >= total_out_tokens) return;
+
+    int out_c = out_tok / chunk_size;
+    int tok_in_chunk = out_tok % chunk_size;
+
+    // On-the-fly tiered index math
+    int src_c = -1;
+    if (out_c < sink_end) {
+        src_c = out_c;
+    } else if (out_c < sink_end + k_to_route) {
+        src_c = routed_idxs[out_c - sink_end];
+    } else {
+        src_c = local_start + (out_c - (sink_end + k_to_route));
+    }
+
+    int src_tok = src_c * chunk_size + tok_in_chunk;
+
+    const char* src_ptr = src + src_tok * token_bytes;
+    char* dst_ptr = dst + out_tok * token_bytes;
+
+    // Vectorized 16-byte copy
+    size_t i = threadIdx.x * 16;
+    for (; i + 16 <= token_bytes; i += blockDim.x * 16) {
+        uint4 val = *reinterpret_cast<const uint4*>(src_ptr + i);
+        *reinterpret_cast<uint4*>(dst_ptr + i) = val;
+    }
+    
+    // Remainder
+    size_t base = (token_bytes / 16) * 16;
+    if (threadIdx.x == 0) {
+        for (size_t j = base; j < token_bytes; ++j) {
+            dst_ptr[j] = src_ptr[j];
+        }
+    }
+}
+
+void ggml_cuda_op_hga_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * routed_idxs = dst->src[0];
+    const ggml_tensor * src = dst->src[1];
+    
+    int32_t params[7];
+    memcpy(params, dst->op_params, sizeof(params));
+    int sink_end = params[0];
+    int k_to_route = params[1];
+    int local_start = params[2];
+    int valid_chunks = params[3];
+    int chunk_size = params[4];
+    int total_out_tokens = params[5];
+    size_t token_bytes = (size_t)params[6];
+    
+    hga_gather_tokens_kernel<<<total_out_tokens, 256, 0, ctx.stream()>>>(
+        (const int32_t*)routed_idxs->data, (const char*)src->data, (char*)dst->data,
+        sink_end, k_to_route, local_start, valid_chunks, chunk_size, token_bytes
+    );
+}
+
+// ==============================================================================
 // ZERO-COPY PINNED MEMORY BRIDGE (Exposed to core llama.cpp)
 // ==============================================================================
 extern "C" {

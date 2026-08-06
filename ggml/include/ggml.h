@@ -578,6 +578,7 @@ extern "C" {
         GGML_OP_HGA_ROUTE,
         GGML_OP_HGA_STITCH,
         GGML_OP_HGA_MASK,
+        GGML_OP_HGA_GATHER,
 
         GGML_OP_UNARY,
 

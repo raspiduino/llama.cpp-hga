@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "HGA_ROUTE",
     "HGA_STITCH",
     "HGA_MASK",
+    "HGA_GATHER",
 
     "UNARY",
 
@@ -1104,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1206,6 +1207,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "hga_route(q_cur, summaries, valid_chunks)",
     "hga_stitch(sink, rout, local, cur, sink_tokens, rout_tokens, local_tokens)",
     "hga_mask(mask_buf, history_tokens, n_tokens)",
+    "hga_gather(chunk_idxs, src, chunk_size)",
 
     "unary(x)",
 
@@ -1223,7 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
