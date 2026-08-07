@@ -93,33 +93,39 @@ void ggml_cuda_op_hga_summary(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 // ==============================================================================
 __global__ void hga_route_kernel(
     const float* __restrict__ Q, const nv_bfloat16* __restrict__ S, float* __restrict__ scores,
-    int head_dim, int n_head_q, int n_head_kv, int n_tokens, int valid_chunks) {
-    int c = blockIdx.x; if (c >= valid_chunks) return;
-    int d = threadIdx.x;
-    int G = n_head_q / n_head_kv;
-    float total_score = 0.0f;
-    if (d < head_dim) {
-        for (int h_kv = 0; h_kv < n_head_kv; ++h_kv) {
-            float q_sum = 0.0f;
-            for (int g = 0; g < G; ++g) {
-                int h_q = h_kv * G + g;
-                for (int t = 0; t < n_tokens; ++t) q_sum += Q[d + h_q * head_dim + t * head_dim * n_head_q];
+    int head_dim, int n_head_q, int n_head_kv, int n_tokens, int valid_chunks) 
+{
+    int c = blockIdx.x; 
+    
+    // Shared memory to cache the mean Q vectors for each KV head group
+    extern __shared__ float s_Q_means[]; 
+    
+    // Cooperatively load and average Q across GQA heads and tokens
+    for (int idx = threadIdx.x; idx < n_head_kv * head_dim; idx += blockDim.x) {
+        int h_kv = idx / head_dim;
+        int d = idx % head_dim;
+        
+        float q_sum = 0.0f;
+        int G = n_head_q / n_head_kv;
+        for (int g = 0; g < G; ++g) {
+            int h_q = h_kv * G + g;
+            for (int t = 0; t < n_tokens; ++t) {
+                q_sum += Q[d + h_q * head_dim + t * head_dim * n_head_q];
             }
-            float q_mean = q_sum / (float)(G * n_tokens);
-            float s_val = __bfloat162float(S[d + h_kv * head_dim + c * head_dim * n_head_kv]);
-            total_score += q_mean * s_val;
         }
+        s_Q_means[h_kv * head_dim + d] = q_sum / (float)(G * n_tokens);
     }
-    for (int offset = 16; offset > 0; offset /= 2) total_score += __shfl_down_sync(0xffffffff, total_score, offset);
-    __shared__ float warp_sums[8];
-    int lane = threadIdx.x % 32, warp_id = threadIdx.x / 32;
-    if (lane == 0) warp_sums[warp_id] = total_score;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float final_sum = 0.0f;
-        int num_warps = (blockDim.x + 31) / 32;
-        for (int i = 0; i < num_warps; ++i) final_sum += warp_sums[i];
-        scores[c] = final_sum / (float)n_head_kv;
+
+    if (c < valid_chunks) {
+        float total_score = 0.0f;
+        // Dot product against the summaries using L1 shared memory
+        for (int h_kv = 0; h_kv < n_head_kv; ++h_kv) {
+            for (int d = 0; d < head_dim; ++d) {
+                total_score += s_Q_means[h_kv * head_dim + d] * __bfloat162float(S[d + h_kv * head_dim + c * head_dim * n_head_kv]);
+            }
+        }
+        scores[c] = total_score / (float)n_head_kv;
     }
 }
 
@@ -128,8 +134,11 @@ void ggml_cuda_op_hga_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     int32_t params[4]; memcpy(params, dst->op_params, sizeof(params));
     int valid_chunks = params[0], n_head_q = params[1], n_head_kv = params[2], n_tokens = params[3];
     int head_dim = src_q->ne[0];
+    
     int block_size = (head_dim <= 128) ? 128 : 256;
-    hga_route_kernel<<<valid_chunks, block_size, 0, ctx.stream()>>>(
+    size_t shared_mem = n_head_kv * head_dim * sizeof(float);
+    
+    hga_route_kernel<<<valid_chunks, block_size, shared_mem, ctx.stream()>>>(
         (const float*)src_q->data, (const nv_bfloat16*)src_s->data, (float*)dst->data,
         head_dim, n_head_q, n_head_kv, n_tokens, valid_chunks);
 }
@@ -268,9 +277,21 @@ __global__ void hga_build_idxs_kernel(
     const float* __restrict__ scores, int32_t* __restrict__ out_idxs,
     int valid_chunks, int sink_end, int k_to_route, int local_start) 
 {
-    // Single thread execution: N=400, K=16 takes < 5 microseconds.
-    // Zero dynamic memory, zero CUB dependency.
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    extern __shared__ char shared_mem[];
+    float* s_scores = (float*)shared_mem;
+    int* s_idxs = (int*)&s_scores[valid_chunks];
+
+    int tid = threadIdx.x;
+    
+    // Cooperatively load scores into shared memory
+    for (int i = tid; i < valid_chunks; i += blockDim.x) {
+        s_scores[i] = scores[i];
+        s_idxs[i] = i;
+    }
+    __syncthreads();
+
+    // Single thread does the selection sort from L1 Shared Memory
+    if (tid == 0) {
         int out_idx = 0;
         
         // 1. Sinks
@@ -278,8 +299,8 @@ __global__ void hga_build_idxs_kernel(
             out_idxs[out_idx++] = i;
         }
         
-        // 2. Top-K (Selection Sort)
-        int selected[64]; // Assuming k_to_route <= 64
+        // 2. Top-K
+        int selected[64]; 
         for (int i = 0; i < k_to_route; i++) {
             float max_val = -1e30f;
             int max_idx = -1;
@@ -290,8 +311,8 @@ __global__ void hga_build_idxs_kernel(
                 }
                 if (is_selected) continue;
                 
-                if (scores[j] > max_val) {
-                    max_val = scores[j];
+                if (s_scores[j] > max_val) {
+                    max_val = s_scores[j];
                     max_idx = j;
                 }
             }
@@ -308,15 +329,17 @@ __global__ void hga_build_idxs_kernel(
 
 void ggml_cuda_op_hga_build_idxs(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * scores = dst->src[0];
-    
+      
     int32_t params[4];
     memcpy(params, dst->op_params, sizeof(params));
     int valid_chunks = params[0];
     int sink_end = params[1];
     int k_to_route = params[2];
     int local_start = params[3];
+      
+    size_t shared_mem = valid_chunks * (sizeof(float) + sizeof(int));
     
-    hga_build_idxs_kernel<<<1, 1, 0, ctx.stream()>>>(
+    hga_build_idxs_kernel<<<1, 256, shared_mem, ctx.stream()>>>(
         (const float*)scores->data, (int32_t*)dst->data,
         valid_chunks, sink_end, k_to_route, local_start
     );
