@@ -57,5 +57,5 @@ ggml_tensor * ggml_hga_route(ggml_context * ctx, ggml_tensor * q_cur, ggml_tenso
 ggml_tensor * ggml_hga_stitch(ggml_context * ctx, ggml_tensor * hist, ggml_tensor * unclosed, ggml_tensor * cur, int32_t hist_tokens, int32_t unclosed_tokens);
 ggml_tensor * ggml_hga_gather(ggml_context * ctx, ggml_tensor * routed_idxs, ggml_tensor * dummy_src, int32_t il, int32_t is_v, int32_t sink_end, int32_t k_to_route, int32_t local_start, int32_t valid_chunks, int32_t chunk_size, int32_t unclosed_tokens);
 ggml_tensor * ggml_hga_build_idxs(ggml_context * ctx, ggml_tensor * scores, int32_t valid_chunks, int32_t sink_end, int32_t k_to_route, int32_t local_start);
-ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, int32_t il, int32_t is_v, int32_t offset_bytes, int32_t bytes_to_copy);
+ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, ggml_tensor * dummy1, ggml_tensor * dummy2, int32_t il, int32_t is_v, int32_t offset_bytes, int32_t bytes_to_copy);
 ggml_tensor * llm_build_hga_attn(const llm_graph_context & llm, llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur, ggml_tensor * kq_b, ggml_tensor * sinks, float kq_scale, int il);

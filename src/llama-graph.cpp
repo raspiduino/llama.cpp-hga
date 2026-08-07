@@ -2674,13 +2674,22 @@ ggml_tensor * llm_graph_context::build_attn(
     if (getenv("LLAMA_HGA") && n_tokens >= 1 && !hparams.is_recr(il)) {
         auto & hga = get_hga_layer(il);
 
-        const auto * mctx_cur = inp->mctx;
+        // Decide BEFORE touching the standard KV cache.
+        // Once HGA attention is active, the dense path never reads the standard KV,
+        // so writing it (host KV with -nkvo) is pure waste AND forces ~3 GPU->CPU
+        // stream syncs per layer per ubatch over Thunderbolt.
+        use_hga_attn = hga.n_chunks_closed >= g_hga_config.num_routed_chunks;
+
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        // 1. Store to Standard KV Cache (Always do this for Prompt Caching compatibility)
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        if (!use_hga_attn) {
+            const auto * mctx_cur = inp->mctx;
+
+            // Bootstrap phase only: dense path still needs the standard KV cache.
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
 
         // 2. Store to Quantized CPU History (Respects -ctk)
         ggml_tensor * k_cur_2d = ggml_reshape_2d(ctx0, k_cur, k_cur->ne[0] * k_cur->ne[1], k_cur->ne[2]);
@@ -2706,8 +2715,10 @@ ggml_tensor * llm_graph_context::build_attn(
         int32_t bytes_v = n_tokens * ggml_row_size(hga.gpu_staging_v->type, n_embd_v);
         
         // Async DMA from VRAM staging to Pinned Host Memory
-        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_k, il, 0, offset_k, bytes_k));
-        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_v, il, 1, offset_v, bytes_v));  
+        // We pass k_idxs and v_idxs as dummy sources to keep them alive in the graph allocator
+        // since we skipped the standard cpy_k/cpy_v that normally anchors them.
+        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_k, k_idxs, v_idxs, il, 0, offset_k, bytes_k));
+        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_v, k_idxs, v_idxs, il, 1, offset_v, bytes_v));  
 
         // 3. Cast to BF16 for Summary Math Purity
         ggml_tensor * k_bf16 = ggml_cast(ctx0, k_cur, GGML_TYPE_BF16);
@@ -2819,10 +2830,6 @@ ggml_tensor * llm_graph_context::build_attn(
         
         hga.carry_count = new_carry_count;
         hga.tokens_processed = end_pos;
-
-        if (hga.n_chunks_closed >= g_hga_config.num_routed_chunks) {
-            use_hga_attn = true;
-        }
     }
 
     // 4. ATTENTION EXECUTION

@@ -109,11 +109,13 @@ ggml_tensor * ggml_hga_build_idxs(ggml_context * ctx, ggml_tensor * scores,
     return out;
 }
 
-ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, int32_t il, int32_t is_v, int32_t offset_bytes, int32_t bytes_to_copy) {
+ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, ggml_tensor * dummy1, ggml_tensor * dummy2, int32_t il, int32_t is_v, int32_t offset_bytes, int32_t bytes_to_copy) {
     // Dummy output tensor to satisfy the graph allocator
     ggml_tensor * out = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     out->op = GGML_OP_HGA_STORE;
     out->src[0] = src;
+    out->src[1] = dummy1; // Keep-alive anchor for k_idxs
+    out->src[2] = dummy2; // Keep-alive anchor for v_idxs
     
     int32_t params[4] = {il, is_v, offset_bytes, bytes_to_copy};
     memcpy(out->op_params, params, sizeof(params));
