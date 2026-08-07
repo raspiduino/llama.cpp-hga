@@ -2096,6 +2096,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_HGA_BUILD_IDXS:
+            {
+                // nop
+            } break;
+        case GGML_OP_HGA_STORE:
+            {
+                // nop
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);

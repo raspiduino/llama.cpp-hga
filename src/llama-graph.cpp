@@ -2686,12 +2686,28 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cur_2d = ggml_reshape_2d(ctx0, k_cur, k_cur->ne[0] * k_cur->ne[1], k_cur->ne[2]);
         ggml_tensor * v_cur_2d = ggml_reshape_2d(ctx0, v_cur, v_cur->ne[0] * v_cur->ne[1], v_cur->ne[2]);
         
-        ggml_tensor * hga_idxs = ggml_arange(ctx0, (float)hga.tokens_processed, (float)(hga.tokens_processed + n_tokens), 1.0f);
-        hga_idxs = ggml_cast(ctx0, hga_idxs, GGML_TYPE_I32);
+        // Create indices for the staging buffer (always starts at 0)
+        ggml_tensor * staging_idxs = ggml_arange(ctx0, 0.0f, (float)n_tokens, 1.0f);
+        staging_idxs = ggml_cast(ctx0, staging_idxs, GGML_TYPE_I32);
 
-        // ggml_set_rows natively handles the F32 -> Q4_0 quantization and PCIe DMA!
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.cpu_hist_k, k_cur_2d, hga_idxs));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.cpu_hist_v, v_cur_2d, hga_idxs));
+        // ggml_set_rows routes to the CUDA backend because both src and dst are VRAM tensors.
+        // This launches the native k_set_rows_quant kernel (F32 -> Q4_0) asynchronously!
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.gpu_staging_k, k_cur_2d, staging_idxs));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, hga.gpu_staging_v, v_cur_2d, staging_idxs));
+        
+        // Calculate byte offset and size for the DMA transfer
+        int64_t n_embd_k = k_cur->ne[0] * k_cur->ne[1];
+        int64_t n_embd_v = v_cur->ne[0] * v_cur->ne[1];
+        
+        int32_t offset_k = hga.tokens_processed * ggml_row_size(hga.gpu_staging_k->type, n_embd_k);
+        int32_t offset_v = hga.tokens_processed * ggml_row_size(hga.gpu_staging_v->type, n_embd_v);
+        
+        int32_t bytes_k = n_tokens * ggml_row_size(hga.gpu_staging_k->type, n_embd_k);
+        int32_t bytes_v = n_tokens * ggml_row_size(hga.gpu_staging_v->type, n_embd_v);
+        
+        // Async DMA from VRAM staging to Pinned Host Memory
+        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_k, il, 0, offset_k, bytes_k));
+        ggml_build_forward_expand(gf, ggml_hga_store(ctx0, hga.gpu_staging_v, il, 1, offset_v, bytes_v));  
 
         // 3. Cast to BF16 for Summary Math Purity
         ggml_tensor * k_bf16 = ggml_cast(ctx0, k_cur, GGML_TYPE_BF16);

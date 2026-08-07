@@ -19,7 +19,7 @@ struct HGAConfig {
 extern HGAConfig g_hga_config;
 
 struct llama_hga_layer {
-    ggml_tensor * cpu_hist_k, * cpu_hist_v, * gpu_scratch_k, * gpu_scratch_v, * gpu_summaries, * gpu_carry_k;    
+    ggml_tensor * cpu_hist_k, * cpu_hist_v, * gpu_scratch_k, * gpu_scratch_v, * gpu_summaries, * gpu_carry_k, * route_scores, * route_counter, * gpu_staging_k, * gpu_staging_v;
     
     ggml_context * ctx_cpu;
     ggml_context * ctx_gpu;
@@ -31,7 +31,7 @@ struct llama_hga_layer {
     void * cpu_hist_k_dev;
     void * cpu_hist_v_dev;
 
-    uint32_t tokens_processed = 0, n_chunks_closed = 0, carry_count = 0; 
+    uint32_t tokens_processed = 0, n_chunks_closed = 0, carry_count = 0;
 };
 
 void hga_init_layers(int n_layers);
@@ -47,6 +47,7 @@ extern "C" {
 void hga_alloc_pinned_mapped(size_t bytes, void** host_ptr, void** dev_ptr);
 void hga_free_pinned_mapped(void* host_ptr);
 
+void* hga_get_pcie_ptr(int il, int is_v);
 #ifdef __cplusplus
 }
 #endif
@@ -54,5 +55,7 @@ void hga_free_pinned_mapped(void* host_ptr);
 ggml_tensor * ggml_hga_summary(ggml_context * ctx, ggml_tensor * k_acc, int32_t start_pos, float theta_base, ggml_tensor * out_slot);
 ggml_tensor * ggml_hga_route(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * summaries, int32_t valid_chunks);
 ggml_tensor * ggml_hga_stitch(ggml_context * ctx, ggml_tensor * hist, ggml_tensor * unclosed, ggml_tensor * cur, int32_t hist_tokens, int32_t unclosed_tokens);
-ggml_tensor * ggml_hga_gather(ggml_context * ctx, ggml_tensor * routed_idxs, ggml_tensor * src, int32_t sink_end, int32_t k_to_route, int32_t local_start, int32_t valid_chunks, int32_t chunk_size);
+ggml_tensor * ggml_hga_gather(ggml_context * ctx, ggml_tensor * routed_idxs, ggml_tensor * dummy_src, int32_t il, int32_t is_v, int32_t sink_end, int32_t k_to_route, int32_t local_start, int32_t valid_chunks, int32_t chunk_size, int32_t unclosed_tokens);
+ggml_tensor * ggml_hga_build_idxs(ggml_context * ctx, ggml_tensor * scores, int32_t valid_chunks, int32_t sink_end, int32_t k_to_route, int32_t local_start);
+ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, int32_t il, int32_t is_v, int32_t offset_bytes, int32_t bytes_to_copy);
 ggml_tensor * llm_build_hga_attn(const llm_graph_context & llm, llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur, ggml_tensor * kq_b, ggml_tensor * sinks, float kq_scale, int il);

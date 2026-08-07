@@ -579,6 +579,8 @@ extern "C" {
         GGML_OP_HGA_STITCH,
         GGML_OP_HGA_MASK,
         GGML_OP_HGA_GATHER,
+        GGML_OP_HGA_BUILD_IDXS,
+        GGML_OP_HGA_STORE,
 
         GGML_OP_UNARY,
 
