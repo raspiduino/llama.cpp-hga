@@ -259,21 +259,24 @@ llama_kv_cache::llama_kv_cache(
             hga.ctx_gpu = ctx_hga_gpu;
               
             // 1. Create Tensors (Metadata only)
-            hga.cpu_hist_k = ggml_new_tensor_2d(ctx_hga_cpu, type_k, n_embd_k_gqa, max_hist_tokens);
-            hga.cpu_hist_v = ggml_new_tensor_2d(ctx_hga_cpu, type_v, n_embd_v_gqa, max_hist_tokens);
-              
-            hga.gpu_scratch_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, working_chunks * chunk_size);
-            hga.gpu_scratch_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, working_chunks * chunk_size);
-            hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_BF16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);
-            hga.gpu_carry_k   = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_F16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), chunk_size);
-            hga.route_scores  = ggml_new_tensor_1d(ctx_hga_gpu, GGML_TYPE_F32, max_chunks);
+            // RESTORED: Use type_k/type_v (e.g. Q4_0) to scale to 1M ctx
+            hga.cpu_hist_k = ggml_new_tensor_2d(ctx_hga_cpu, type_k, n_embd_k_gqa, max_hist_tokens);  
+            hga.cpu_hist_v = ggml_new_tensor_2d(ctx_hga_cpu, type_v, n_embd_v_gqa, max_hist_tokens);  
+                
+            hga.gpu_scratch_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, working_chunks * chunk_size);  
+            hga.gpu_scratch_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, working_chunks * chunk_size);  
+            hga.gpu_summaries = ggml_new_tensor_3d(ctx_hga_gpu, GGML_TYPE_BF16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), max_chunks);  
+            
+            // RESTORED: Q4_0 Carry Buffers
+            hga.gpu_carry_k   = ggml_new_tensor_3d(ctx_hga_gpu, type_k, hparams.n_embd_head_k(il), hparams.n_head_kv(il), chunk_size);
+            hga.gpu_carry_v   = ggml_new_tensor_3d(ctx_hga_gpu, type_v, hparams.n_embd_head_v(il), hparams.n_head_kv(il), chunk_size);
+            
+            hga.route_scores  = ggml_new_tensor_1d(ctx_hga_gpu, GGML_TYPE_F32, max_chunks);  
             hga.route_counter = ggml_new_tensor_1d(ctx_hga_gpu, GGML_TYPE_I32, 1);
 
-            // Staging buffers for async DMA. Capped at 16384 tokens (~8MB/layer) to save VRAM.
-            // If you run with -b > 16384, increase this cap.
-            const int64_t staging_capacity = std::min((uint32_t)max_hist_tokens, 16384u);
-            hga.gpu_staging_k = ggml_new_tensor_2d(ctx_hga_gpu, type_k, n_embd_k_gqa, staging_capacity);
-            hga.gpu_staging_v = ggml_new_tensor_2d(ctx_hga_gpu, type_v, n_embd_v_gqa, staging_capacity);
+            // Allocate Mapped State Block
+            hga_alloc_pinned_mapped(sizeof(HGA_Decode_State), (void**)&hga.cpu_state, (void**)&hga.dev_state);
+            memset(hga.cpu_state, 0, sizeof(HGA_Decode_State));
               
             // =====================================================================
             // 2. EXPLICIT ALLOCATION (GPU Standard + CPU Zero-Copy Pinned)
