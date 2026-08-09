@@ -101,10 +101,14 @@ ggml_tensor * ggml_hga_store(ggml_context * ctx, ggml_tensor * src, ggml_tensor 
     return out;  
 }
 
-ggml_tensor * ggml_hga_mask(ggml_context * ctx, ggml_tensor * kq_mask, int32_t n_tokens, int32_t static_max_seq, HGA_Decode_State* dev_state) {
+ggml_tensor * ggml_hga_mask(ggml_context * ctx, ggml_tensor * dummy_dep, int32_t n_tokens, int32_t static_max_seq, HGA_Decode_State* dev_state) {
     ggml_tensor * out = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, static_max_seq, n_tokens, 1, 1);
     out->op = GGML_OP_HGA_MASK;
-    out->src[0] = kq_mask;
+    
+    // CLEAN ANCHOR: Satisfies the graph allocator so it assigns a compute buffer,
+    // but doesn't trigger shape-change invalidations.
+    out->src[0] = dummy_dep; 
+    
     int32_t params[4] = {n_tokens, static_max_seq, 0, 0};
     memcpy(&params[2], &dev_state, sizeof(HGA_Decode_State*));
     memcpy(out->op_params, params, sizeof(params));
@@ -196,10 +200,12 @@ ggml_tensor * llm_build_hga_attn(
     ggml_tensor * k_perm = ggml_permute(ctx0, k_full_3d, 0, 2, 1, 3);    
     ggml_tensor * v_perm = ggml_permute(ctx0, v_full_3d, 0, 2, 1, 3);    
     
-    ggml_tensor * kq_mask = inp->get_kq_mask();    
-    ggml_tensor * hga_mask = ggml_hga_mask(ctx0, kq_mask, n_tokens, static_max_seq, hga.dev_state);  
-    ggml_build_forward_expand(gf, hga_mask);  
-    ggml_tensor * fa_mask = (n_tokens > 1) ? hga_mask : nullptr;    
+    // CLEAN ANCHOR: We pass k_full_3d as a dummy dependency.
+    // It is already in the graph, and its shape (static_max_seq) is strictly constant during decode.
+    // This satisfies the graph allocator WITHOUT triggering the per-token shape change of kq_mask.
+    ggml_tensor * hga_mask = ggml_hga_mask(ctx0, k_full_3d, n_tokens, static_max_seq, hga.dev_state);
+    ggml_build_forward_expand(gf, hga_mask);
+    ggml_tensor * fa_mask = (n_tokens > 1) ? hga_mask : nullptr;
     
     // PASS Q4_0 DIRECTLY TO FLASH ATTENTION!  
     ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q_perm, k_perm, v_perm, fa_mask, kq_scale,    

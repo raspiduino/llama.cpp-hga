@@ -1977,6 +1977,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // FIX: If HGA is active, kq_mask is intentionally pruned from the graph to prevent 
+    // shape-change invalidations. The graph allocator will not assign a buffer to pruned leaves. 
+    // Gracefully skip the upload instead of crashing.
+    if (!dst || !dst->buffer) return;
+    
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
